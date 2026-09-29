@@ -17,7 +17,7 @@ library(microbiome)
 library(RColorBrewer)
 library(ggpubr)
 library(vegan)
-path <- "/home/spanuser/Spanbauer/alyssa_reads/18s.reads/"
+path <- "/home///18s.read/"
 list.files(path)
 ```
 
