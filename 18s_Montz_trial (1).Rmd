@@ -1,0 +1,591 @@
+---
+title: "18s.montz.script"
+author: "carson montz"
+date: "2023-07-02"
+output: html_document
+---
+
+```{r}
+library(dada2); packageVersion("dada2")
+library(decontam)
+library(ggplot2)
+library(phyloseq)
+library(openxlsx)
+library(Biostrings)
+library(dplyr)
+library(microbiome)
+library(RColorBrewer)
+library(ggpubr)
+library(vegan)
+path <- "/home/spanuser/Spanbauer/alyssa_reads/18s.reads/"
+list.files(path)
+```
+
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+plotQualityProfile(fnFs[1:59])
+plotQualityProfile(fnRs[1:59])
+```
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft=c(19,20), truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) 
+head(out)
+```
+#Learn errors forward
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+#lear errors reverse
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+#subset
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+```
+
+```{r}
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+seqtaball <- makeSequenceTable(mergers)
+dim(seqtaball)
+table(nchar(getSequences(seqtaball)))
+seqtab <- seqtaball[,nchar(colnames(seqtaball)) %in% 240:387]
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+```
+
+```{r}
+
+#load trainer
+fasta_gz_file <- "/home/spanuser/Spanbauer/alyssa_reads/pr2_version_5.0.0_SSU_dada2.fasta.gz"
+
+
+```
+
+```{r}
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+taxa.PR <- assignTaxonomy(seqtab.nochim, fasta_gz_file, multithread=FALSE, taxLevels=c("Domain", "Supergroup", "Division","Subdivision", "Class", "Order", "Family", "Genus", "Species"))
+
+
+taxa.print <- taxa.PR # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+save.image(file ="18S.Rdata",version = NULL,safe = TRUE)
+
+```
+
+```{r}
+# save sequences with original headers
+write.csv(t(seqtab.nochim), paste0("seqtab-nochim.csv"), quote=FALSE)
+
+
+# simplify names to sequence headers(seq1, seq2...seq100...)
+seqs <- colnames(seqtab.nochim)
+SeqName <- vector(dim(seqtab.nochim)[2], mode="character")
+SeqName_ft <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  SeqName[i] <- paste("seq", i, sep="")
+  SeqName_ft[i] <- paste(">seq", i, sep="")
+}
+
+# write sequences in a FASTA file
+fastaseqs_ft <- rbind(SeqName_ft, seqs)
+write(fastaseqs_ft, paste0("fastaseqs.fasta"))
+
+
+# write sequences in a FASTA file (tabular)
+fastaseqs <- cbind(SeqName, seqs)
+write.csv(fastaseqs, paste0("fastaseqs.csv"), quote=FALSE, row.names = FALSE)
+
+
+# write count table
+seqtab.nochim.t <- t(seqtab.nochim)
+row.names(seqtab.nochim.t) <- SeqName
+seqtab.nochim.t <- tibble::rownames_to_column(as.data.frame(seqtab.nochim.t), "SeqName")
+write.csv(seqtab.nochim.t, paste0("counts.csv"), quote=FALSE, row.names = FALSE)
+
+# write taxonomy table
+taxtable <- taxa.PR
+row.names(taxtable) <- SeqName
+taxtable <- tibble::rownames_to_column(as.data.frame(taxtable), "SeqName")
+write.csv(taxtable, paste0("taxtable.csv"), quote=FALSE, row.names = FALSE)
+
+
+# Join results and save in spreadsheet (excel) format
+
+tax_counts <- left_join(taxtable, seqtab.nochim.t, by = "SeqName", keep = TRUE)
+tax_counts_fasta <- left_join(tax_counts, as.data.frame(fastaseqs), by = c("SeqName.x" = "SeqName"), keep = TRUE)
+openxlsx::write.xlsx(tax_counts_fasta, file = paste0("18s.reads_ASV_PR2.xlsx"), overwrite = TRUE, asTable = FALSE, sheetName = "18s.reads", firstRow = TRUE, zoom = 90, keepNA = TRUE)
+```
+
+```{r setup, include=FALSE}
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fasta")
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+asv_tax <- taxtable
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+write.table(asv_tax, "ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+
+colnames(asv_tab)
+
+asv_tab
+```
+
+#The vector for decontam is avector that distinguishes blanks (TRUE) from samples (FALSE). This chunk is creating a decontaminated taxonomy table and count table with an algortithm that sorts out taxa deemed as contaminants.
+```{r}
+
+vector_for_decontam<- as.logical(c("TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "TRUE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE"
+))
+contam_df <- isContaminant(t(asv_tab), neg=vector_for_decontam)
+table(contam_df$contaminant)
+contam_asvs <- row.names(contam_df[contam_df$contaminant == TRUE, ])
+
+contam_indices <- which(asv_fasta %in% paste0(">", contam_asvs))
+dont_want <- sort(c(contam_indices, contam_indices + 1))
+asv_fasta_no_contam <- asv_fasta[- dont_want]
+
+asv_tax[row.names(asv_tax) %in% contam_asvs, ]
+asv_tab_no_contam <- asv_tab[!row.names(asv_tab) %in% contam_asvs, ]
+asv_tax_no_contam <- asv_tax[!row.names(asv_tax) %in% contam_asvs, ]
+
+write(asv_fasta_no_contam, "18ASVs-no-contam.fa")
+write.table(asv_tab_no_contam, "18ASVs_counts-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+write.table(asv_tax_no_contam, "18ASVs_taxonomy-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+
+
+
+```
+
+#next is to make the phyloseqs object using our decontaminated & filtered (blanks removed) tsv files. We will create a metadata file too. If you have one just load it in. *The metadata file we created here is not sufficient to perform PCA techniques on. However, it is still good code to create the foundation of a metadata file as it ensures the "SampleID" column s a perfect match. But we will need to add more data to the metadata (i.e in excel), then load in that new metadata file. 
+```{r}
+
+
+# Load the count table
+count_table <- read.table("/home/spanuser3/Documents/18ASvs_counts-no-contamB.txt", sep="\t", header=TRUE, row.names= 1)
+
+# View the loaded count table
+count_table
+
+# Identify the columns that include "Blank" in their names
+blank_columns <- grepl("Blank", colnames(count_table))
+
+# Remove the identified blank columns from the count table
+count_table_filtered <- count_table[, !blank_columns]
+
+# View the filtered count table
+count_table_filtered
+
+# Extract the columns from Count_table_filtered that do not contain "BR" in their column names
+br_cols <- grep("BR", colnames(count_table_filtered), value = TRUE)
+#9 Br, whats strange is if i remove these i still won't have 45 samples. which you'd think I would if the 9 Sites were each sampled once through 5 months. I can get it to 44, but the month of September is missing any sample from site 9. So either we pay no mind to that, or dump all samples from September, or we remove all samples from S9. That too much for me to decide, i'm not sure why samples are missing, maybe there was an error when transferring the fasta files into the 16s reads folder. Its really too late for me to ahve recognized this and tackle it as i notied this on 8.4.23
+
+# Remove the second column from br_columns
+#br_columns <- br_cols[-2]
+
+# Subset Count_table_filtered to remove the columns with "BR" in their names
+count_table_filtered <- count_table_filtered[, !(colnames(count_table_filtered) %in% br_cols)]
+
+
+# Create a metadata object with a single column containing the sample IDs
+#metadata <- data.frame(SampleID = colnames(count_table_filtered))
+
+# Set row names of the metadata object to match the sample IDs
+#row.names(metadata) <- metadata$SampleID
+
+
+#this metadata will have data added to it in exccel (columns Date, Site). Load in updated metadata
+MetaData <- read.table("/home/spanuser3/Documents/18s.MetadataB.tsv.txt", sep="\t", header=TRUE, row.names = 1)
+
+rows <- rownames(MetaData)
+
+# Get the row names (headers) that contain "BR"
+br_row_headers <- rownames(MetaData)[grep("BR", rownames(MetaData))]
+#br_row_headersB <- br_row_headers[-2]
+
+# Remove the rows with headers that contain "BR"
+MetaDataB <- MetaData[!(rownames(MetaData) %in% br_row_headers), ]
+
+#format metadata for merge phyloseq
+Phy.meta=sample_data(MetaDataB)
+
+
+#now that we have all three lets create our phyloseq object
+
+# Convert the filtered count table to an OTU table
+count_table_otu <- otu_table(as.matrix(count_table_filtered), taxa_are_rows=TRUE)
+
+# Load the taxonomy table
+taxonomy_table <- read.table("/home/spanuser3/Documents/18ASVs_taxonomy-no-contamB.txt", sep="\t", header=TRUE, row.names=1)
+
+# Create the taxonomic table
+tax_table_m <- tax_table(as.matrix(taxonomy_table))
+
+
+
+
+# Create the phyloseq object by merging the components
+merged_phyloseq <- merge_phyloseq(count_table_otu, tax_table_m, Phy.meta)
+
+merged_phyloseq
+
+#create YEL.asv.com object to simplify using shan's code
+YEL.asv.com <- merged_phyloseq
+
+# Remove phy_tree from the phyloseq object
+YEL.asv.com@phy_tree <- NULL
+```
+
+
+#I was having trouble getting the plots to not be jumbled, and Shan provided me through some  that made the plots much easier on the eye and much better.
+```{r}
+# We need to set Palette
+taxic <- as.data.frame(YEL.asv.com@tax_table)
+
+colourCount <- 20
+getPalette <- colorRampPalette(brewer.pal(12, "Set3"))
+
+#create column names for plot
+taxic$OTU <- rownames(taxic)
+colnames(taxic)
+
+taxmat <- as.matrix(taxic)
+new.tax <- tax_table(taxmat)
+tax_table(YEL.asv.com) <- new.tax
+
+# it would be nice to have the Taxonomic names in italics.
+# for that we set this
+guide_italics <- guides(fill = guide_legend(label.theme = element_text(
+  size = 15,
+  face = "italic", colour = "Black", angle = 0
+)))
+```
+
+#we want to aggregate our taxa to a level, in this case i've chosen "family" but you can change this area of the code to "class", "order", "genus" etc. Then first we use the transform() to make the data "compositional", which transforms it into relative abundance.
+```{r}
+# Aggregate at seperate level (note that our trainer.fasta has options: SeqName / Domain / Supergroup / Division / Subdivision / Class / Order / Family / Genus / Species / OTU)
+YEL.rel <- aggregate_taxa(YEL.asv.com, "Genus")
+YEL.Fam <- aggregate_taxa(YEL.asv.com, "Family")
+YEL.Order <- aggregate_taxa(YEL.asv.com, "Order")
+
+# Transform to relative abundance
+YEL.Genus <- microbiome::transform(YEL.rel, "compositional")
+rel.Fam <- microbiome::transform(YEL.Fam, "compositional")
+rel.Order <- microbiome::transform(YEL.Order, "compositional")
+
+```
+
+#phyloseq's top_taxa(data, n=x) creates a vector, and then we can subset the taxa in the original phyloseq object using prune_taxa() and te vector we just ceated. This way we can plot only the most abundant Taxa for analysis.
+```{r}
+#get the nams of the top 13 most abundant taxa
+TTN <- top_taxa(YEL.Genus, n=13)
+TTN.F <- top_taxa(rel.Fam, n=13)
+TTN.O <- top_taxa(rel.Order, n=13)
+
+#Remove NAs if present, all had "unknown" as [1]. if it was [6] we'd ammend the code to show data[-6]
+#TTN.G <- TTN[-1]
+#TTN.FA <-TTN.F[-1]
+#TTN.OR <- TTN.O[-1]
+#you may not need this code with the filter taxic lines below
+
+
+# Subset the taxa in the original objects
+Pruned_18s_Gen <- prune_taxa(TTN, YEL.Genus)
+Pruned_18s_Fam <- prune_taxa(TTN.F, rel.Fam)
+Pruned_18s_Ord <- prune_taxa(TTN.O, rel.Order)
+
+
+# Filter taxic object to remove rows with NA in Genus
+#Everytime you run this line is will flip the results in the plot, meaning if NAs are present, you must go back and run this line.
+taxic_filtered <- taxic[!is.na(taxic$Genus), ]
+taxic_filtered <- taxic[!is.na(taxic$Family), ]
+taxic_filtered <- taxic[!is.na(taxic$Order), ]
+
+
+
+```
+
+#now lets try plotting
+#Composition at Genus Level
+```{r}
+plot.composition.relAbun <- plot_composition(Pruned_18s_Gen,
+                                             sample.sort = "SampleID",
+                                             x.label = "env_material") 
+plot.composition.relAbun <- plot.composition.relAbun + theme(legend.position = "bottom") 
+plot.composition.relAbun <- plot.composition.relAbun + scale_fill_manual("Genus",
+                                                                       values = getPalette(colourCount),
+                                                                       labels = unique(taxic_filtered$Genus)) + theme_bw() 
+plot.composition.relAbun <- plot.composition.relAbun + theme(axis.text.x = element_text(angle = 90, size = 5)) 
+plot.composition.relAbun <- plot.composition.relAbun + ggtitle("18s Relative abundance at Genus Level") + guide_italics + theme(legend.title = element_text(size = 5))
+
+# Adjust the legend to two columns
+plot.composition.relAbun <- plot.composition.relAbun + guides(fill = guide_legend(ncol = 2))
+
+print(plot.composition.relAbun)
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18s_Genus_compositionB_plot.pdf")
+
+```
+
+#Composition at Family Level
+```{r}
+plot.composition.relAbun <- plot_composition(Pruned_18s_Fam,
+                                             sample.sort = "SampleID",
+                                             x.label = "env_material") 
+
+plot.composition.relAbun <- plot.composition.relAbun + theme(legend.position = "bottom") 
+plot.composition.relAbun <- plot.composition.relAbun + scale_fill_manual("Family",
+                                                                       values = getPalette(colourCount),
+                                                                       labels = unique(taxic_filtered$Family)) + theme_bw() 
+plot.composition.relAbun <- plot.composition.relAbun + theme(axis.text.x = element_text(angle = 90, size = 5)) 
+
+# Adjust the size of the legend text using cex
+plot.composition.relAbun <- plot.composition.relAbun + theme(legend.text = element_text(size = 7))
+
+plot.composition.relAbun <- plot.composition.relAbun + ggtitle("18s Relative abundance at Family Level") + guide_italics + theme(legend.title = element_text(size = 5))
+
+# Adjust the legend to two columns
+plot.composition.relAbun <- plot.composition.relAbun + guides(fill = guide_legend(ncol = 2))
+
+print(plot.composition.relAbun)
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18s_Family_compositionB_plot.pdf")
+
+```
+#Composition at Order level
+```{r}
+plot.composition.relAbun <- plot_composition(Pruned_18s_Ord,
+                                             sample.sort = "SampleID",
+                                             x.label = "env_material") 
+plot.composition.relAbun <- plot.composition.relAbun + theme(legend.position = "bottom") 
+plot.composition.relAbun <- plot.composition.relAbun + scale_fill_manual("Order",
+                                                                       values = getPalette(colourCount),
+                                                                       labels = unique(taxic_filtered$Order)) + theme_bw() 
+plot.composition.relAbun <- plot.composition.relAbun + theme(axis.text.x = element_text(angle = 90, size = 5)) 
+plot.composition.relAbun <- plot.composition.relAbun + ggtitle("18s Relative abundance at Order Level") + guide_italics + theme(legend.title = element_text(size = 5))
+
+# Adjust the legend to two columns
+plot.composition.relAbun <- plot.composition.relAbun + guides(fill = guide_legend(ncol = 2))
+
+print(plot.composition.relAbun)
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18s_Order_compositionB_plot.pdf")
+```
+
+
+
+```{r}
+save.image("/home/spanuser3/Documents/my_workspace_B.RData")
+
+load("/home/spanuser3/Documents/my_workspace_B.RData")
+
+```
+
+
+#we need to perform rarefaction on our data to normalize for diversity analysis. It is ultimately the choise of a researcher on whether they want to aggreate the data to a taxa level. I have decided not to do this, but  specific resolution diversity metrics can be created with simply a single line of code if desire.
+```{r}
+# Load the required packages
+library(ggpubr)
+
+# Assuming 'MetaData' is your metadata dataframe
+sample_names <- rownames(MetaDataB)
+
+# Generate a vector of colors with unique colors for each sample name
+sample_colors <- rainbow(45)
+
+# Create a dataframe with 'sample_names' as the row names and 'sample_colors' as a column named 'Color'
+sample_colors_df <- data.frame(SampleName = sample_names, Color = sample_colors, row.names = sample_names)
+
+# Create the rarefaction curve plot and convert it to a ggplot2 object
+rarecurve_plot <- rarecurve(t(count_table_filtered), step = 100, col = sample_colors_df$Color, lwd = 2, ylab = "ASVs", label = FALSE)
+abline(v = min(rowSums(t(count_table_filtered))))
+
+# Add the legend with smaller text and multiple columns using the 'legend' function
+legend("topright", legend = sample_colors_df$SampleName, fill = sample_colors_df$Color, title = "Sample Names", cex = 0.4, ncol = 2)
+
+# Add the centered title to the plot
+title("18s rarefaction curves", cex.main = 1.5)
+```
+
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+#load("/home/spanuser3/Documents/my_workspace_B.RData")
+
+#note that the objects can either be YEL.asv.com or merged_phyloseq
+# Find the lowest number of counts per sample
+min_read_count <- min(sample_sums(YEL.asv.com))
+
+# Print the lowest number of counts per sample
+min_read_count
+#its 111
+
+# Perform rarefaction analysis at the depth of the smallest sample
+#seed can be any value, sample.size should match the counts from min sample
+rarefied_physeq <- rarefy_even_depth(YEL.asv.com, rngseed = 123, sample.size = 111)
+
+# View the rarefied phyloseq object
+rarefied_physeq
+
+```
+
+#Lets calculate and view some alpha diversity metrics. Theplot_richness() function can be used to plot many diversity metrics, and we should adjust the text because our samle labels are overlapping. I'm going to break the graphics into two chunks to make it easier on the eye. 
+```{r}
+rarefied_18s_plots <- plot_richness(rarefied_physeq, measures=c("Shannon"))
+
+# Adjust the size of the x-axis labels
+rarefied_18s_plotsA <- rarefied_18s_plots + theme(axis.text.x = element_text(size = 4))  # Adjust the size (8 is an example, modify as desired)
+
+rarefied_18s_plotsA
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18_Shannon.pdf", plot = rarefied_18s_plotsA)
+
+```
+
+#repreat process for other diversity metrics
+```{r}
+rarefied_18s_plotB <- plot_richness(rarefied_physeq, measures=c("Observed"))
+
+# Adjust the size of the x-axis labels
+rarefied_18s_plotsBB <- rarefied_18s_plotB + theme(axis.text.x = element_text(size = 4))  # Adjust the size (8 is an example, modify as desired)
+
+rarefied_18s_plotsBB
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18_Observed.pdf", plot = rarefied_18s_plotsBB)
+
+```
+
+```{r}
+rarefied_18s_plotc <- plot_richness(rarefied_physeq, measures=c("Simpson"))
+
+# Adjust the size of the x-axis labels
+rarefied_18s_plotscb <- rarefied_18s_plotc + theme(axis.text.x = element_text(size = 4))  # Adjust the size (8 is an example, modify as desired)
+
+rarefied_18s_plotscb
+
+# Save the plot as a PDF file
+ggsave("/home/spanuser3/Documents/18_Simpson.pdf", plot = rarefied_18s_plotsBB)
+```
+
+
+#Now we will Plot 18s Bray-Curtis distances. To do so we need to aggreagte our rarefied_phyloseq to A taxa level, i've decided Genus, Then tranfsorm it to compositional, we don't necessaerily need to subset the data to only show the top taxa becasue we want to find natural trends. 
+```{r}
+
+#the following chunk assumes all all prior packages (phyloseq, microbiome, etc) have been loaded
+#the vegan package is the only new one
+
+library(vegan)
+
+load("/home/spanuser3/Documents/my_workspace_B.RData")
+
+#aggregate to genus level
+rarefied_genus <- aggregate_taxa(rarefied_physeq, "Genus")
+
+# Transform to relative abundance
+rarefied_genus <- microbiome::transform(rarefied_genus, "compositional")
+
+#rarefied_genus@phy_tree <- NULL 
+
+# Assuming "Site" is a character column and "Date" is a character/numeric column in the metadata (Phy.meta)
+# If needed, convert "Site" and "Date" to factors for better plotting
+sample_data(rarefied_genus)$Site <- factor(sample_data(rarefied_genus)$Site)
+sample_data(rarefied_genus)$Date <- factor(sample_data(rarefied_genus)$Date)
+
+# Calculate Bray-Curtis dissimilarity matrix
+bray_curtis_dist <- phyloseq::distance(rarefied_genus, method = "bray")
+
+# Perform PCA using the Bray-Curtis dissimilarity matrix
+pca_result <- cmdscale(bray_curtis_dist, k = 2, eig = TRUE)
+
+# Extract PCA scores for plotting
+pca_scores <- as.data.frame(pca_result$points)
+
+# Add Site and Date information to the PCA scores data frame
+pca_scores$Site <- sample_data(rarefied_genus)$Site
+pca_scores$Date <- sample_data(rarefied_genus)$Date
+
+# Create a 2D PCA plot
+p <- ggplot(pca_scores, aes(x = V1, y = V2, color = Site)) +
+  geom_point(size = 3) +
+  labs(title = "18s Bray-Curtis PCA ", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+# Facet the plot by Date (assuming Date is a character or factor column)
+p_faceted <- p + facet_wrap(~ Date)
+
+# Print the faceted plot
+print(p_faceted)
+
+pdf_file <- "/home/spanuser3/Documents/18s_braycurtis_PCA"
+ggsave(filename = pdf_file, plot = p_faceted, device = "pdf")
+```
+
+
+#This plot has visualized the bray-curtis distance measurements by treatment site during each sampling month. There are many different ways to plot this, but I thought this was a good start. 
+```{r}
+# Assuming you have already run the previous code to create 'pca_scores' data frame
+
+# Assuming you have already run the previous code to create 'pca_scores' data frame
+
+# Load the necessary library if not already loaded
+library(ggplot2)
+
+# Plot the data with ggplot
+byplot <- ggplot(pca_scores, aes(x = V1, y = V2, color = Site, shape = Date)) +
+  geom_point(size = 4) +
+  labs(x = "PC1", y = "PC2") +
+  scale_shape_manual(values = c(15, 25, 16, 18, 17)) + # Specify different shapes for each month
+  scale_color_discrete(name = "Site") + # Specify the legend title for color
+  ggtitle("18s Bray Curtis PCA") + # Add the plot title
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) # Center the plot title
+
+
+
+pdf_fileB <- "/home/spanuser3/Documents/18_BC_byplot.pdf"
+ggsave(filename = pdf_fileB, plot = byplot, device = "pdf")
+
+byplot
+
+```
+
+
+
